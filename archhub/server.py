@@ -14,17 +14,20 @@ from pathlib import Path
 
 import pandas as pd
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse
 
 from . import __version__
-from .client import ArchHubClient, KINDS, DAILY_CALL_CAP
+from .client import (
+    ArchHubClient, KINDS, DAILY_CALL_CAP, REORG_SIDO_NAME, REORG_SIGUNGU, REORG_UNMAPPED,
+)
 from .errors import not_found, format_error
 from .formatting import (
     df_to_text, profile_to_text, district_to_text, floors_to_text,
     price_history_to_text, demolitions_to_text, pipeline_to_text, seismic_to_text,
     parcel_history_to_text, temp_buildings_to_text,
-    _date, _age_years, _num,
+    _date, _age_years, _approval_date, _num,
 )
 
 
@@ -142,6 +145,30 @@ def _fetch_septic(sigungu_code: str, bdong_code: str, bun: str, ji: str):
             items.append(" ".join(seg))
     return " · ".join(dict.fromkeys(items)) or None
 
+
+def _region_hint(sigungu_code) -> list[str]:
+    """NOT_FOUND 재시도 제안 맨 앞에 붙일 개편 안내. 2026 행정구역 개편의 종전 시군구코드가
+    아니면 빈 목록 (이슈 #2 — 종전 코드는 건축HUB가 0건을 준다, client.REORG_* 참조)."""
+    sg = str(sigungu_code).strip()
+    if sg in REORG_SIGUNGU:
+        return [(f"{sg}는 개편 전 코드 — {REORG_SIDO_NAME}(2026-07-01 출범) 지역은 건축HUB가 "
+                 f"새 시군구코드 {REORG_SIGUNGU[sg]}로만 응답합니다(bdong_code는 그대로)")]
+    if sg in REORG_UNMAPPED:
+        return [(f"{sg}는 행정구역 개편 지역의 종전 코드 — {REORG_UNMAPPED[sg]}. 건축HUB는 종전 코드에 "
+                 "0건을 줄 수 있고, 이 서버의 법정동 테이블엔 새 구 코드가 아직 없습니다")]
+    return []
+
+
+def _tool_error(e: Exception, ctx: str) -> ToolError:
+    """도구 실패(외부 API 시간 초과·연결 실패·HTTP/응답 오류, 입력 오류)를 MCP isError=true로 올린다.
+
+    본문은 format_error 그대로([EXTERNAL_API_ERROR] 등 + 키 마스킹). 문자열로 돌려주면 클라이언트가
+    성공 결과로 받는다(gomdori-mcp#4). 정상 0건([NOT_FOUND])은 오류가 아니라 일반 결과로 남긴다.
+    호출측은 `raise ... from None` — 원 예외(requests 메시지엔 serviceKey가 든 URL이 있음)가
+    트레이스백 체인에 실리지 않게 끊는다."""
+    return ToolError(format_error(e, ctx))
+
+
 mcp = FastMCP(
     name="archhub",
     instructions=(
@@ -152,6 +179,9 @@ mcp = FastMCP(
         "데이터는 모두 공식 API 실측값이며, 결과가 없으면 추측하지 말고 '데이터 없음'을 보고한다."
     ),
     auth=_build_auth(),
+    # version 을 넘기지 않으면 FastMCP 가 자기 라이브러리 버전으로 serverInfo 를 채운다
+    # — 클라이언트에 3.4.x 가 이 서버 버전으로 표시된다.
+    version=__version__,
 )
 
 
@@ -190,7 +220,7 @@ def find_region(keyword: str, limit: int = 20) -> str:
     try:
         res = client.find_region(" ".join(region_terms))
     except Exception as e:
-        return format_error(e, "find_region")
+        raise _tool_error(e, "find_region") from None
     if len(res) == 0:
         return not_found(f"'{keyword}' 에 해당하는 지역 없음", [
             "시/구/동 이름 일부로 다시 검색",
@@ -209,6 +239,9 @@ def find_region(keyword: str, limit: int = 20) -> str:
     note = "아래 sigungu_code/bdong_code를 다른 도구의 인자로 사용하세요."
     if bun:
         note += f" 입력의 번지는 bun={bun}" + (f", ji={ji}" if ji else "") + " 로 전달하세요."
+    if "구시도명" in res.columns and (res["구시도명"] != "").any():
+        note += (f" ※ {REORG_SIDO_NAME}(2026-07-01 광주광역시·전라남도 통합) 지역은 새 코드(12xxx)로 "
+                 "조회됩니다 — 종전 29xxx·46xxx 코드는 건축HUB에서 0건.")
     return df_to_text(out, max_rows=limit, note=note)
 
 
@@ -219,11 +252,12 @@ def _query(kind: str, ctx: str, type_name, sigungu_code, bdong_code, bun, ji, ma
             bun=bun, ji=ji, num_rows=max_rows, page_no=page,
         )
     except Exception as e:
-        return format_error(e, ctx)
+        raise _tool_error(e, ctx) from None
     if len(df) == 0:
         return not_found(
             f"{ctx} '{type_name}' 결과 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
-            ["find_region으로 코드 재확인", "bun/ji 없이 동 전체로 조회", "조회 유형(type_name) 변경"],
+            _region_hint(sigungu_code)
+            + ["find_region으로 코드 재확인", "bun/ji 없이 동 전체로 조회", "조회 유형(type_name) 변경"],
         )
     note = f"유형={type_name} · 전체 {total}건 · page={page}"
     return df_to_text(df, max_rows=max_rows, note=note)
@@ -306,11 +340,12 @@ def building_profile(
             bun=bun, ji=ji, num_rows=100,
         )
     except Exception as e:
-        return format_error(e, "building_profile")
+        raise _tool_error(e, "building_profile") from None
     if len(df) == 0:
         return not_found(
             f"건축물대장 표제부 없음 (sigungu={sigungu_code}, bdong={bdong_code}, bun={bun}, ji={ji})",
-            ["find_region으로 코드 재확인", "ji(부번) 조정", "건축물대장이 없는 필지일 수 있음"],
+            _region_hint(sigungu_code)
+            + ["find_region으로 코드 재확인", "ji(부번) 조정", "건축물대장이 없는 필지일 수 있음"],
         )
     zoning = _fetch_zoning(sigungu_code, bdong_code, bun, ji)
     septic = _fetch_septic(sigungu_code, bdong_code, bun, ji)
@@ -339,34 +374,38 @@ def old_buildings(
     try:
         df, total = client.query("ledger", "표제부", sigungu_code, bdong_code, fetch_all=True)
     except Exception as e:
-        return format_error(e, "old_buildings")
+        raise _tool_error(e, "old_buildings") from None
     if len(df) == 0:
-        return not_found(f"표제부 데이터 없음 (sigungu={sigungu_code}, bdong={bdong_code})")
+        return not_found(f"표제부 데이터 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
+                         _region_hint(sigungu_code))
 
     collected = len(df)
     trunc = f" (응답 한도로 {collected}건만 수집)" if collected < total else ""
 
     col = "사용승인일"
     if col not in df.columns:
-        return format_error(Exception(f"표제부에 '{col}' 컬럼 없음. 실제 컬럼: {list(df.columns)}"), "old_buildings")
+        raise _tool_error(Exception(f"표제부에 '{col}' 컬럼 없음. 실제 컬럼: {list(df.columns)}"), "old_buildings")
 
     d = df.copy()
     d[col] = d[col].astype(str).str.strip()
-    d["경과연수"] = pd.to_numeric(d[col].map(_age_years), errors="coerce")  # 월·일 반영 만 경과연수
-    unknown = int(d["경과연수"].isna().sum())  # 사용승인일 미상/파싱불가 → 노후 판정 불가로 제외됨
+    state = d[col].map(lambda v: _approval_date(v)[0])
+    unknown = int((state == "missing").sum())  # 사용승인일 빈값 → 노후 판정 불가로 제외됨
+    invalid = int((state == "invalid").sum())  # '0930'·'17250300' 같은 입력 오류 → 정렬에서 제외 (이슈 #3)
+    d["경과연수"] = pd.to_numeric(d[col].map(_age_years), errors="coerce")  # 월·일 반영 만 경과연수(미상·이상값은 NaN)
     d = d.dropna(subset=["경과연수"])
     d["경과연수"] = d["경과연수"].astype(int)
     old = d[d["경과연수"] >= min_age_years].sort_values("경과연수", ascending=False)
+    excluded_note = f" · 승인일 미상 {unknown}건 제외" if unknown else ""
+    excluded_note += f" · 승인일 이상값 {invalid}건 제외" if invalid else ""
     if len(old) == 0:
-        return not_found(f"경과 {min_age_years}년 이상 건축물 없음 (표제부 전체 {total}건)")
+        return not_found(f"경과 {min_age_years}년 이상 건축물 없음 (표제부 전체 {total}건{excluded_note})")
 
     candidate = ["건물명", "도로명대지위치", "대지위치", "주용도코드명",
                  "사용승인일", "경과연수", "연면적", "지상층수", "세대수"]
     cols = [c for c in candidate if c in old.columns]
     out = old[cols].copy()
     out["사용승인일"] = out["사용승인일"].map(lambda v: _date(v) or v)  # YYYYMMDD → YYYY-MM-DD
-    unknown_note = f" · 승인일 미상 {unknown}건 제외" if unknown else ""
-    note = f"표제부 {total}건{trunc} 중 경과 {min_age_years}년↑ {len(old)}건 (경과연수 내림차순){unknown_note}"
+    note = f"표제부 {total}건{trunc} 중 경과 {min_age_years}년↑ {len(old)}건 (경과연수 내림차순){excluded_note}"
     return df_to_text(out, max_rows=top, note=note)
 
 
@@ -393,11 +432,11 @@ def district_stats(
     try:
         df, total = client.query("ledger", "표제부", sigungu_code, bdong_code, fetch_all=True)
     except Exception as e:
-        return format_error(e, "district_stats")
+        raise _tool_error(e, "district_stats") from None
     if len(df) == 0:
         return not_found(
             f"표제부 데이터 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
-            ["find_region으로 코드 재확인"],
+            _region_hint(sigungu_code) + ["find_region으로 코드 재확인"],
         )
     collected = len(df)
     trunc = f" (응답 한도로 {collected}건만 집계)" if collected < total else ""
@@ -436,11 +475,12 @@ def building_floors(
             bun=bun, ji=ji, num_rows=100,
         )
     except Exception as e:
-        return format_error(e, "building_floors")
+        raise _tool_error(e, "building_floors") from None
     if len(df) == 0:
         return not_found(
             f"층별개요 없음 (sigungu={sigungu_code}, bdong={bdong_code}, bun={bun}, ji={ji})",
-            ["find_region으로 코드 재확인", "ji(부번) 조정", "building_profile로 동 단위 먼저 확인"],
+            _region_hint(sigungu_code)
+            + ["find_region으로 코드 재확인", "ji(부번) 조정", "building_profile로 동 단위 먼저 확인"],
         )
     return floors_to_text(df, total, max_floors)
 
@@ -478,11 +518,12 @@ def price_history(
             bun=bun, ji=ji, fetch_all=True,
         )
     except Exception as e:
-        return format_error(e, "price_history")
+        raise _tool_error(e, "price_history") from None
     if len(df) == 0:
         return not_found(
             f"주택가격(공시가격) 없음 (sigungu={sigungu_code}, bdong={bdong_code}, bun={bun}, ji={ji})",
-            ["find_region으로 코드 재확인", "ji(부번) 조정", "공시가격이 없는 필지(비주거 등)일 수 있음"],
+            _region_hint(sigungu_code)
+            + ["find_region으로 코드 재확인", "ji(부번) 조정", "공시가격이 없는 필지(비주거 등)일 수 있음"],
         )
     return price_history_to_text(df, total, top_units, bun=bun, ji=ji)
 
@@ -510,11 +551,11 @@ def demolitions(
     try:
         df, total = client.query("permit", "철거멸실관리대장", sigungu_code, bdong_code, fetch_all=True)
     except Exception as e:
-        return format_error(e, "demolitions")
+        raise _tool_error(e, "demolitions") from None
     if len(df) == 0:
         return not_found(
             f"철거멸실 데이터 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
-            ["find_region으로 코드 재확인"],
+            _region_hint(sigungu_code) + ["find_region으로 코드 재확인"],
         )
     collected = len(df)
     trunc = f" (응답 한도로 {collected}건만 수집)" if collected < total else ""
@@ -546,11 +587,11 @@ def permits_pipeline(
     try:
         df, total = client.query("permit", "기본개요", sigungu_code, bdong_code, fetch_all=True)
     except Exception as e:
-        return format_error(e, "permits_pipeline")
+        raise _tool_error(e, "permits_pipeline") from None
     if len(df) == 0:
         return not_found(
             f"건축인허가 기본개요 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
-            ["find_region으로 코드 재확인"],
+            _region_hint(sigungu_code) + ["find_region으로 코드 재확인"],
         )
     collected = len(df)
     trunc = f" (응답 한도로 {collected}건만 수집)" if collected < total else ""
@@ -585,11 +626,11 @@ def seismic_check(
     try:
         df, total = client.query("ledger", "표제부", sigungu_code, bdong_code, fetch_all=True)
     except Exception as e:
-        return format_error(e, "seismic_check")
+        raise _tool_error(e, "seismic_check") from None
     if len(df) == 0:
         return not_found(
             f"표제부 데이터 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
-            ["find_region으로 코드 재확인"],
+            _region_hint(sigungu_code) + ["find_region으로 코드 재확인"],
         )
     collected = len(df)
     trunc = f" (응답 한도로 {collected}건만 집계)" if collected < total else ""
@@ -632,11 +673,11 @@ def parcel_history(
                 bun=bun, ji=ji, num_rows=100,
             )
         except Exception as e:
-            return format_error(e, f"parcel_history({type_name})")
+            raise _tool_error(e, f"parcel_history({type_name})") from None
     if all(len(f) == 0 for f in frames.values()):
         return not_found(
             f"필지 연혁 없음 (sigungu={sigungu_code}, bdong={bdong_code}, bun={bun}, ji={ji})",
-            ["find_region으로 코드 재확인", "ji(부번) 조정"],
+            _region_hint(sigungu_code) + ["find_region으로 코드 재확인", "ji(부번) 조정"],
         )
     return parcel_history_to_text(frames["permits"], frames["demos"], frames["temps"],
                                   bun=bun, ji=ji, top=top)
@@ -669,11 +710,11 @@ def temp_buildings(
         df, total = client.query("permit", "가설건축물", sigungu_code, bdong_code,
                                  bun=bun, ji=ji, fetch_all=True)
     except Exception as e:
-        return format_error(e, "temp_buildings")
+        raise _tool_error(e, "temp_buildings") from None
     if len(df) == 0:
         return not_found(
             f"가설건축물 데이터 없음 (sigungu={sigungu_code}, bdong={bdong_code})",
-            ["find_region으로 코드 재확인"],
+            _region_hint(sigungu_code) + ["find_region으로 코드 재확인"],
         )
     collected = len(df)
     trunc = f" (응답 한도로 {collected}건만 집계)" if collected < total else ""

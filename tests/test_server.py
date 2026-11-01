@@ -82,6 +82,32 @@ def test_find_region_bunji_only_is_not_found(monkeypatch):
     assert "[NOT_FOUND]" in out and "지역 키워드" in out
 
 
+# ---- 행정구역 개편 지역 (이슈 #2) ----
+
+def test_find_region_notes_reorganized_codes(monkeypatch):
+    from archhub.client import _apply_reorg
+    monkeypatch.setattr(server.client, "_bdong", _apply_reorg(pd.DataFrame([
+        {"시도명": "전라남도", "시군구명": "순천시", "읍면동명": "연향동", "동리명": "",
+         "법정동코드": "4615011400"},
+    ])))
+    out = server.find_region("전라남도 순천시 연향동")
+    assert "12150" in out and "11400" in out and "46150" not in out
+    assert "종전 29xxx·46xxx 코드는 건축HUB에서 0건" in out
+    _patch_bdong(monkeypatch)
+    assert "종전" not in server.find_region("광진구 자양동")   # 개편 무관 지역엔 안내 없음
+
+
+def test_not_found_hints_reorganized_region_codes(monkeypatch):
+    # 종전 코드로 조회해 0건이면 재시도 제안 맨 앞에 새 코드 안내 (이슈 #2 재현 입력)
+    monkeypatch.setattr(server.client, "query", lambda *a, **k: (pd.DataFrame(), 0))
+    out = server.district_stats("46150", "13300")   # 순천 조례동
+    assert "[NOT_FOUND]" in out and "새 시군구코드 12150" in out and "전남광주통합특별시" in out
+    assert "새 시군구코드 12240" in server.old_buildings("29140", "12000")   # 광주 서구 치평동
+    assert "제물포구" in server.building_data("ledger", "표제부", "28110", "10100")   # 인천 중구(폐지)
+    assert "분구" in server.parcel_history("41590", "25321", bun="1")             # 화성시
+    assert "개편" not in server.district_stats("11215", "10500")                 # 무관 지역
+
+
 # ---- parcel_history / temp_buildings 도구 ----
 
 def _route_query(responses):
@@ -186,6 +212,32 @@ def test_building_data_routes_kind_to_query(monkeypatch):
     out = server.building_data("housing", "동별개요", "11215", "10500")
     assert seen == {"kind": "housing", "type_name": "동별개요"}
     assert "테스트빌" in out and "유형=동별개요" in out
+
+
+# ---- old_buildings 사용승인일 이상값 (이슈 #3) ----
+
+def test_old_buildings_excludes_invalid_approval_dates(monkeypatch):
+    # 전주 효자동1가 실측 원값 '0930    '·'17250300'이 경과 1096·301년으로 1·2위를 먹던 버그
+    yr = datetime.date.today().year
+    df = pd.DataFrame([
+        {"대지위치": "효자동1가 568-15번지", "사용승인일": "0930    "},
+        {"대지위치": "효자동1가 439번지", "사용승인일": "17250300"},
+        {"대지위치": "효자동1가 356번지", "사용승인일": "1930    "},
+        {"대지위치": "효자동1가 1-1번지", "사용승인일": f"{yr - 45}0101"},
+        {"대지위치": "효자동1가 2-2번지", "사용승인일": " "},
+    ])
+    monkeypatch.setattr(server.client, "query", lambda *a, **k: (df, len(df)))
+    out = server.old_buildings("52111", "14000", min_age_years=40, top=2)
+    assert "568-15" not in out and "439번지" not in out and "1096" not in out
+    assert out.index("356번지") < out.index("1-1번지")    # 1930 승인이 1위
+    assert "승인일 미상 1건 제외" in out and "승인일 이상값 2건 제외" in out
+
+
+def test_old_buildings_not_found_reports_excluded_invalid(monkeypatch):
+    df = pd.DataFrame([{"대지위치": "효자동1가 568-15번지", "사용승인일": "0930    "}])
+    monkeypatch.setattr(server.client, "query", lambda *a, **k: (df, len(df)))
+    out = server.old_buildings("52111", "14000", min_age_years=40)
+    assert "[NOT_FOUND]" in out and "승인일 이상값 1건 제외" in out
 
 
 # ---- permits_pipeline 기본 since_year ----

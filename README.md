@@ -2,6 +2,7 @@
 
 **국토교통부 건축HUB 3개 API를 12개 도구로.** 건축물대장·건축인허가·주택인허가 + 법정동코드 조회 + **용도지역·정화조 포함 종합카드** + **필지 연혁 타임라인** + **가설건축물 존치 스캔** + **층별 구성** + **동 단위 통계·규모 벤치마크** + **노후건축물 분석** + **내진 취약 추정** + **공시가격 시계열** + **철거멸실(석면)** + **인허가 파이프라인**을 AI 어시스턴트에서 자연어로 바로.
 
+[![version](https://img.shields.io/badge/version-0.4.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org)
 [![FastMCP 3.x](https://img.shields.io/badge/FastMCP-3.x-green.svg)](https://github.com/jlowin/fastmcp)
@@ -9,7 +10,7 @@
 > 국가법령정보 MCP가 "법령"을, 통계 MCP가 "통계"를 다루듯, 이건 **건축물 실체 데이터**를 다룬다.
 > 건축물대장 · 건축인허가 · 주택인허가 — data.go.kr 공식 API 실측값만, 출처를 명시하고, 없으면 `[NOT_FOUND]`로 환각을 차단.
 
-remote 커넥터(fly.io)가 떠 있어, 사용자는 **URL만 등록하면** 별도 설정 없이 바로 쓴다.
+remote 커넥터가 통합 호스트 `mcp.gomdori.app`에 떠 있어, 사용자는 **URL만 등록하면** 별도 설정 없이 바로 쓴다.
 
 ---
 
@@ -316,7 +317,7 @@ Claude Desktop은 원격 HTTP를 직접 못 붙이므로 `mcp-remote` 어댑터 
 
 > v0.4.0에서 raw 3종(`building_ledger`/`building_permit`/`housing_permit`)을 `building_data` 하나로 통합했다 — 파라미터가 동일하고 대장 종류만 달라, 도구 수를 줄여 LLM의 도구 선택 혼란과 스키마 토큰을 같이 줄였다. 원본 표 출력은 빈 컬럼·코드/코드명 중복·조회인자 에코를 자동 생략(생략 수 명시)해 토큰을 아낀다.
 
-모든 응답은 공식 API 실측값이며 **출처를 명시**한다. 결과가 없으면 `[NOT_FOUND]`, 에러는 `[EXTERNAL_API_ERROR]` 등 머신 파싱 프리픽스 + "LLM은 추측 금지" 경고로 환각을 차단한다.
+모든 응답은 공식 API 실측값이며 **출처를 명시**한다. 결과가 없으면 `[NOT_FOUND]`, 에러는 `[EXTERNAL_API_ERROR]` 등 머신 파싱 프리픽스 + "LLM은 추측 금지" 경고로 환각을 차단한다. 에러(외부 API 시간 초과·연결 실패·HTTP/응답 오류, 입력 오류 `[INVALID_PARAMETER]`)는 MCP 결과에도 `isError: true`로 표시되고, 0건 `[NOT_FOUND]`는 오류가 아닌 일반 결과(`isError: false`)다.
 
 ---
 
@@ -421,6 +422,8 @@ claude mcp add archhub -e ARCHHUB_SERVICE_KEY=<디코딩 키> -- archhub-mcp
 ```bash
 pip install -e ".[dev]"   # 먼저 설치(안 하면 bare `pytest`는 ModuleNotFoundError)
 pytest tests/             # 외부 API 비의존(네트워크 mock) · 115 케이스
+# Docker 와 같은 고정 조합으로 재현하려면: pip install -r requirements.txt && pip install --no-deps PublicDataReader==1.1.1.post2
+# (PublicDataReader 가 취약한 requests==2.32.3 을 하드핀해서 --no-deps 로 우회, 사유는 requirements.txt 머리말)
 ```
 
 변경 이력은 [CHANGELOG.md](CHANGELOG.md) 참고.
@@ -430,17 +433,33 @@ pytest tests/             # 외부 API 비의존(네트워크 mock) · 115 케�
 
 ---
 
-## 배포 (fly.io)
+## 배포
+
+프로덕션 서빙은 **통합 호스트 `gomdori-mcp`**(fly 머신 1대에 MCP 5종 동거, 비공개 레포)가 맡는다. 이 레포는 PyPI 미배포라, 통합 호스트가 GitHub main을 **커밋 SHA로 고정**해 `pip install`한다.
+
+```bash
+# 1) 이 레포 main에 커밋·푸시
+# 2) 통합 호스트 Dockerfile의 핀(pip install git+...@<sha>)을 갱신하고 배포
+cd ../gomdori-mcp && fly deploy -c fly.production.toml
+curl https://mcp.gomdori.app/healthz            # 5종 프로세스 상태
+curl https://mcp.gomdori.app/archhub/health     # 버전·키 만료 D-day·호출수
+```
+
+> 핀 SHA를 안 바꾸면 푸시해도 옛 코드가 그대로 서빙된다(Docker 레이어 캐시).
+
+직접 띄우려면 저장소의 `fly.toml`로 단독 앱을 만들 수도 있다:
 
 ```bash
 fly launch --no-deploy                              # fly.toml 인식
 fly secrets set ARCHHUB_SERVICE_KEY="<디코딩 키>"   # 인증키 주입 (평문 커밋 금지)
 fly secrets set ARCHHUB_DAILY_CALL_CAP=9000         # (선택) 일일 호출 상한 — 초과 시 차단
 fly deploy
-fly scale count 1                                   # streamable-http 세션 일관성 위해 단일 머신
+fly scale count 1                                   # 일일 호출 캡 카운터가 프로세스 로컬 → 단일 머신
 ```
 
-`auto_stop_machines=suspend` + `min_machines_running=0`로 무요청 시 비용 절감, 요청 오면 자동 기동. streamable-http는 세션 기반이라 **단일 머신으로 운영**한다(여러 머신이면 세션이 머신 간에 깨진다). `/health`는 버전·키 적재 여부·**만료 D-day**·오늘/누적 호출수·일일 상한을 노출한다.
+http 전송은 **stateless**라 `Mcp-Session-Id` 없이 붙는 클라이언트도 그대로 동작한다(대신 GET `/mcp` SSE 스트림은 막히고 POST/DELETE만 허용 — 조회 전용 서버라 영향 없음). 다만 일일 호출 캡 카운터가 프로세스 메모리에 있어 **단일 머신으로 운영**한다. `/health`는 버전·키 적재 여부·**만료 D-day**·오늘/누적 호출수·일일 상한을 노출한다.
+
+> **버전 표기 주의** — 이 패키지의 버전은 `/health`의 `version`(= `0.4.0`)이다. MCP `initialize` 응답의 `serverInfo.version`은 생성자에 `version=`을 주지 않아 **FastMCP 라이브러리 버전**이 그대로 나오므로, 둘이 달라 보여도 정상이다.
 
 ---
 
@@ -451,13 +470,14 @@ fly scale count 1                                   # streamable-http 세션 일
   - 건축인허가 `1613000/ArchPmsHubService`
   - 주택인허가 `1613000/HsPmsHubService`
 - 영문 컬럼은 한글로 자동 변환 (PublicDataReader 매핑 재활용)
-- 법정동코드 테이블은 런타임에 로드 후 캐시
+- 법정동코드 테이블은 런타임에 로드 후 캐시. 원본이 2024-08-01 기준이라 **전남광주통합특별시**(2026-07-01, 광주광역시·전라남도 통합) 새 코드(12xxx — 건축HUB는 새 코드로만 응답, 실측)를 덧씌운다. "전라남도 순천시"·"광주광역시 서구"처럼 옛 이름으로도 찾아진다. 인천 중구·동구·서구(폐지)와 화성시(분구)는 새 구 코드를 아직 반영하지 못해, 종전 코드로 0건이면 개편 안내를 붙인다.
 - 동기 도구는 FastMCP가 워커 스레드풀로 위임 → http 동시요청에도 이벤트루프 비차단
 
 ## 한계 · 주의
 
 - **트래픽 한도**: 단시간 대량 호출은 외부 API 정책상 제한될 수 있다. `/health`의 호출수(`api_calls`·`calls_today`)로 사용량을 관측하고, 필요하면 `ARCHHUB_DAILY_CALL_CAP`으로 일일 상한을 둔다.
 - **위반건축물 조회 불가**: 표제부/기본개요/총괄표제부 어디에도 위반건축물 필드가 없음(실측 확인) → API로 조회 불가.
+- **사용승인일 이상값**: 대장 원값에 입력 오류(`0930`, `17250300` 등)가 섞여 있다. 1900년 이전·미래·달력에 없는 날짜·숫자 형식이 아닌 값은 `old_buildings`·`district_stats`·`seismic_check`의 경과연수·연대·내진 판정에서 빼고 `승인일 이상값 N건 제외`로 건수를 밝힌다(빈값 `미상`과 따로 셈). 연도만 있는 값(`1963`)은 정상으로 보고 1월 1일 기준으로 계산한다.
 - **개인정보 제외**: 소유자(소유정보) 조회는 범위 밖.
 - **동 전체 조회는 무거움**: 큰 동은 수천 건. `old_buildings`/`district_stats`/`demolitions`/`permits_pipeline`는 전체를 받아 다소 느릴 수 있다. 페이지당 100건 고정이라 1만 행까지 순회 수집하며, 초과분은 응답에 절단을 명시한다. `price_history`는 필지(`bun`) 단위라 가볍다.
 
